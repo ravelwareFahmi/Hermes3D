@@ -16,6 +16,9 @@
 
 const { EventEmitter } = require("node:events");
 const { randomUUID } = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const { HermesAgentJsonRpcClient, redactUrl } = require("./jsonrpc-client");
 const { createOfficeSpeechSubscriber } = require("./office-speech");
@@ -39,6 +42,57 @@ const MAIN_SESSION_KEY = `agent:${AGENT_ID}:${MAIN_KEY}`;
 
 /** hermes-agent's `session.create` / `session.resume` can be slow on a cold profile. */
 const SESSION_RPC_TIMEOUT_MS = 60_000;
+
+// --- synthesised-agent store ------------------------------------------------
+//
+// hermes-agent is a single-agent backend: it has no profile or agent creation
+// RPC at all. Hermes3D's office is a fleet, so multi-agent support is done
+// here — the roster of bridge-created agents and their playbook jobs lives in
+// a small JSON store next to the Studio settings, and each agent gets a
+// workspace directory whose AGENTS.md hermes injects as the role brief.
+
+/** Studio-side state directory for the hermes-agent adapter. */
+const STATE_DIR = path.join(os.homedir(), ".hermes", "hermes3d");
+/** Persisted roster: { agents: [...], jobs: { "<job_id>": {...} } }. */
+const VIRTUAL_STORE_FILE = path.join(STATE_DIR, "virtual-agents.json");
+/** Reported through `config.get` so the UI can derive per-agent workspaces. */
+const VIRTUAL_CONFIG_PATH = path.join(STATE_DIR, "config.json");
+/** Agent directive files are plain markdown leaves inside the agent workspace. */
+const AGENT_FILE_NAME = /^[A-Za-z0-9_-]+\.md$/;
+
+const loadVirtualStore = () => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(VIRTUAL_STORE_FILE, "utf8"));
+    return {
+      agents: Array.isArray(parsed?.agents) ? parsed.agents : [],
+      jobs: parsed?.jobs && typeof parsed.jobs === "object" ? parsed.jobs : {},
+    };
+  } catch {
+    return { agents: [], jobs: {} };
+  }
+};
+
+const saveVirtualStore = (store) => {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const tmp = `${VIRTUAL_STORE_FILE}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+  fs.renameSync(tmp, VIRTUAL_STORE_FILE);
+};
+
+const isExistingDirectory = (value) => {
+  try {
+    return fs.statSync(value).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
+const slugifyAgentName = (name) =>
+  asString(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
 
 /**
  * The slice of the `ws` WebSocket surface `gateway-proxy.js` relies on.
@@ -117,8 +171,10 @@ const CRON_STATUSES = new Set(["ok", "error", "skipped"]);
  * milliseconds, and a `state` object. Forwarding the raw rows crashes the
  * office task board, which reads `job.payload.kind` unguarded.
  */
-const toHermes3dCronJobs = (jobs, agentId = AGENT_ID) => {
+const toHermes3dCronJobs = (jobs, agentForJob = AGENT_ID) => {
   if (!Array.isArray(jobs)) return [];
+  const resolveAgentId =
+    typeof agentForJob === "function" ? agentForJob : () => agentForJob;
   return jobs
     .filter((job) => job && typeof job === "object")
     .map((job) => {
@@ -129,10 +185,11 @@ const toHermes3dCronJobs = (jobs, agentId = AGENT_ID) => {
       const message =
         asString(job.prompt_preview) || asString(job.name) || "Scheduled job";
 
+      const jobId = asString(job.job_id) || asString(job.id);
       return {
-        id: asString(job.job_id) || asString(job.id),
-        name: asString(job.name) || asString(job.job_id) || "Scheduled job",
-        agentId,
+        id: jobId,
+        name: asString(job.name) || jobId || "Scheduled job",
+        agentId: resolveAgentId(jobId),
         description: asString(job.prompt_preview) || undefined,
         enabled: job.enabled !== false,
         updatedAtMs: lastRunAtMs ?? nextRunAtMs ?? Date.now(),
@@ -211,6 +268,83 @@ const resolveDefaultAgentId = (agents) => {
   const explicit = agents.find((a) => a.isDefault);
   return explicit?.id ?? agents[0]?.id ?? AGENT_ID;
 };
+
+/** Persisted store row -> Hermes3D agent row. */
+const toVirtualAgent = (row) => {
+  const name = asString(row?.name) || asString(row?.id, "Agent");
+  return {
+    id: asString(row?.id),
+    name,
+    workspace: asString(row?.workspace),
+    identity: { name, emoji: asString(row?.emoji, "🧑‍💻") },
+    role: asString(row?.role),
+    profile: "",
+    virtual: true,
+  };
+};
+
+/**
+ * Hermes3D schedule union -> the one string `cron.manage` accepts.
+ *
+ * `parse_schedule` understands 5-field cron, `every <n><m|h|d>` intervals
+ * (no seconds), and one-shot timestamps.
+ */
+const toBackendSchedule = (schedule) => {
+  if (!schedule || typeof schedule !== "object") return "0 9 * * *";
+  if (schedule.kind === "every") {
+    const everyMs = Number(schedule.everyMs);
+    if (Number.isFinite(everyMs) && everyMs > 0) {
+      if (everyMs % 86_400_000 === 0) return `every ${everyMs / 86_400_000}d`;
+      if (everyMs % 3_600_000 === 0) return `every ${everyMs / 3_600_000}h`;
+      // Durations below a minute round up: parse_duration has no seconds unit.
+      return `every ${Math.max(1, Math.ceil(everyMs / 60_000))}m`;
+    }
+  }
+  if (schedule.kind === "at" && asString(schedule.at)) return asString(schedule.at);
+  return asString(schedule.expr) || "0 9 * * *";
+};
+
+/**
+ * The scheduler runs job prompts from its own cwd, not the agent's workspace,
+ * so the role brief is handed over as an absolute path to read first.
+ */
+const buildJobPrompt = (agent, message) => {
+  const name = asString(agent?.name, AGENT_NAME);
+  const workspace = asString(agent?.workspace);
+  const brief = workspace
+    ? `You are the office agent "${name}". Read your role brief at ` +
+      `${path.join(workspace, "AGENTS.md")} and follow it for this task.`
+    : `You are the office agent "${name}".`;
+  return `${brief}\n\nTask:\n${message}`;
+};
+
+/**
+ * Hermes3D `CronJobSummary` for a job the backend list hides.
+ *
+ * `cron.manage list` never returns paused jobs (`include_disabled` is not
+ * exposed over RPC), but a paused playbook still belongs in the office's
+ * Active Jobs, so it is re-hydrated from the local store.
+ */
+const toStoredCronJob = (jobId, meta) => ({
+  id: jobId,
+  name: asString(meta?.name, jobId),
+  agentId: asString(meta?.agentId, AGENT_ID),
+  description: asString(meta?.prompt) || undefined,
+  enabled: meta?.enabled === true,
+  updatedAtMs: Number(meta?.createdAt) || Date.now(),
+  schedule: toHermes3dSchedule(asString(meta?.schedule)),
+  sessionTarget: "isolated",
+  wakeMode: "next-heartbeat",
+  payload: {
+    kind: "agentTurn",
+    message: asString(meta?.message, asString(meta?.prompt, "Scheduled job")),
+  },
+  state: {
+    ...(Number.isFinite(meta?.lastRunAtMs) ? { lastRunAtMs: meta.lastRunAtMs } : {}),
+    ...(meta?.lastStatus ? { lastStatus: meta.lastStatus } : {}),
+  },
+  delivery: { mode: "none" },
+});
 
 function createHermesAgentUpstream(options) {
   const {
@@ -328,6 +462,12 @@ function createHermesAgentUpstream(options) {
     const { agentId, tail } = parseSessionKey(sessionKey);
     const profile = profileForAgent(agentId);
     const scope = profile ? { profile } : {};
+    // A synthesised agent's workspace carries its AGENTS.md role brief, and
+    // hermes injects the context files under the session cwd — so the brief
+    // only reaches the model when the session runs inside that workspace.
+    const rosterEntry = agentRoster.find((a) => a.id === agentId);
+    const workspace = rosterEntry?.virtual ? asString(rosterEntry.workspace) : "";
+    if (workspace && isExistingDirectory(workspace)) scope.cwd = workspace;
 
     // A key of the form `agent:<id>:<storedId>` refers to a stored hermes-agent
     // session; anything else starts a fresh one.
@@ -470,6 +610,17 @@ function createHermesAgentUpstream(options) {
 
   // --- method dispatch ------------------------------------------------------
 
+  /**
+   * Rebuild the roster from disk so an agent created or deleted on one
+   * connection is seen by every connection (and by the next roster read).
+   */
+  const applyVirtualAgents = () => {
+    const virtuals = loadVirtualStore()
+      .agents.map(toVirtualAgent)
+      .filter((agent) => agent.id);
+    agentRoster = [...agentRoster.filter((agent) => !agent.virtual), ...virtuals];
+  };
+
   /** Load the fleet once per connection; a backend without profiles keeps one agent. */
   const loadAgentRoster = async () => {
     try {
@@ -479,11 +630,17 @@ function createHermesAgentUpstream(options) {
         agentRoster = mapped;
         defaultAgentId = resolveDefaultAgentId(mapped);
         log(`[hermes-agent] ${mapped.length} profile(s) mapped to agents: ${mapped.map((a) => a.id).join(", ")}`);
+        applyVirtualAgents();
         return;
       }
       log("[hermes-agent] profiles.list returned nothing; using a single agent");
     } catch (err) {
       log(`[hermes-agent] profiles.list unavailable (${errorMessage(err)}); using a single agent`);
+    }
+    applyVirtualAgents();
+    const virtualCount = agentRoster.filter((a) => a.virtual).length;
+    if (virtualCount > 0) {
+      log(`[hermes-agent] roster: default agent + ${virtualCount} synthesised agent(s)`);
     }
   };
 
@@ -538,6 +695,9 @@ function createHermesAgentUpstream(options) {
       features: {
         methods: [
           "agents.list",
+          "agents.create",
+          "agents.update",
+          "agents.delete",
           "agents.files.get",
           "agents.files.set",
           "sessions.list",
@@ -561,6 +721,9 @@ function createHermesAgentUpstream(options) {
           "tasks.list",
           "tasks.update",
           "cron.list",
+          "cron.add",
+          "cron.remove",
+          "cron.run",
         ],
         events: ["chat", "agent", "presence", "heartbeat", "cron"],
       },
@@ -578,6 +741,7 @@ function createHermesAgentUpstream(options) {
 
     switch (method) {
       case "agents.list":
+        applyVirtualAgents();
         return resOk(id, {
           defaultId: defaultAgentId,
           mainKey: MAIN_KEY,
@@ -590,18 +754,125 @@ function createHermesAgentUpstream(options) {
           })),
         });
 
-      case "agents.files.get":
-        return resOk(id, { file: { missing: true } });
+      case "agents.create": {
+        const name = asString(p.name);
+        if (!name) {
+          return resErr(id, "hermes_agent.agent_name_required", "Agent name is required.");
+        }
+        const store = loadVirtualStore();
+        const taken = new Set([
+          ...agentRoster.map((a) => a.id),
+          ...store.agents.map((a) => asString(a.id)),
+        ]);
+        const base = slugifyAgentName(name) || "agent";
+        let agentId = base;
+        for (let n = 2; taken.has(agentId); n += 1) agentId = `${base}-${n}`;
+        // The UI derives a workspace from `config.get`'s path and hands it
+        // back here; anything non-absolute falls back next to the store.
+        const requested = asString(p.workspace);
+        const workspace =
+          requested && path.isAbsolute(requested)
+            ? requested
+            : path.join(STATE_DIR, `workspace-${agentId}`);
+        try {
+          fs.mkdirSync(workspace, { recursive: true });
+        } catch (err) {
+          return resErr(id, "hermes_agent.workspace_failed", errorMessage(err));
+        }
+        store.agents.push({
+          id: agentId,
+          name,
+          workspace,
+          role: asString(p.role),
+          createdAt: Date.now(),
+        });
+        saveVirtualStore(store);
+        applyVirtualAgents();
+        log(`[hermes-agent] created agent "${name}" (${agentId}) at ${workspace}`);
+        return resOk(id, { agentId, name, workspace });
+      }
 
-      case "agents.files.set":
-        return resOk(id, {});
+      case "agents.update": {
+        const agentId = asString(p.agentId);
+        const name = asString(p.name);
+        if (!agentId || !name) {
+          return resErr(id, "hermes_agent.agent_update_invalid", "agentId and name are required.");
+        }
+        const store = loadVirtualStore();
+        const row = store.agents.find((a) => asString(a.id) === agentId);
+        if (!row) {
+          return resErr(id, "hermes_agent.agent_not_found", `Agent "${agentId}" not found.`);
+        }
+        row.name = name;
+        if (asString(p.role)) row.role = asString(p.role);
+        saveVirtualStore(store);
+        applyVirtualAgents();
+        return resOk(id, { ok: true, agentId, name });
+      }
+
+      case "agents.delete": {
+        const agentId = asString(p.agentId);
+        if (!agentId) {
+          return resErr(id, "hermes_agent.agent_id_required", "agentId is required.");
+        }
+        const store = loadVirtualStore();
+        const kept = store.agents.filter((a) => asString(a.id) !== agentId);
+        if (kept.length === store.agents.length) {
+          return resErr(id, "hermes_agent.agent_not_found", `Agent "${agentId}" not found.`);
+        }
+        store.agents = kept;
+        saveVirtualStore(store);
+        applyVirtualAgents();
+        log(`[hermes-agent] deleted agent "${agentId}"`);
+        return resOk(id, { ok: true, removed: true, removedBindings: 0 });
+      }
+
+      case "agents.files.get": {
+        const agentId = asString(p.agentId);
+        const name = asString(p.name);
+        const row = loadVirtualStore().agents.find((a) => asString(a.id) === agentId);
+        if (!row || !AGENT_FILE_NAME.test(name)) {
+          return resOk(id, { file: { missing: true } });
+        }
+        const workspace = asString(row.workspace);
+        const filePath = path.join(workspace, name);
+        try {
+          const content = fs.readFileSync(filePath, "utf8");
+          return resOk(id, { workspace, file: { missing: false, content, path: filePath } });
+        } catch {
+          return resOk(id, { workspace, file: { missing: true } });
+        }
+      }
+
+      case "agents.files.set": {
+        const agentId = asString(p.agentId);
+        const name = asString(p.name);
+        const content = typeof p.content === "string" ? p.content : null;
+        const row = loadVirtualStore().agents.find((a) => asString(a.id) === agentId);
+        if (!row || content === null || !AGENT_FILE_NAME.test(name)) {
+          return resErr(
+            id,
+            "hermes_agent.files_set_invalid",
+            "agentId, a markdown file name, and content are required.",
+          );
+        }
+        try {
+          const workspace = asString(row.workspace);
+          fs.mkdirSync(workspace, { recursive: true });
+          fs.writeFileSync(path.join(workspace, name), content, "utf8");
+        } catch (err) {
+          return resErr(id, "hermes_agent.files_set_failed", errorMessage(err));
+        }
+        return resOk(id, { ok: true, agentId, name });
+      }
 
       case "config.get":
         return resOk(id, {
           config: { gateway: { reload: { mode: "hot" } } },
           hash: "hermes-agent",
           exists: true,
-          path: "",
+          // Non-empty so `agents.create` can derive a default workspace.
+          path: VIRTUAL_CONFIG_PATH,
         });
 
       case "config.patch":
@@ -613,6 +884,22 @@ function createHermesAgentUpstream(options) {
         // be read per agent; they're local SQLite reads, so fan out in parallel.
         const perAgent = await Promise.all(
           agentRoster.map(async (agent) => {
+            // Stored sessions belong to the backend's single default profile;
+            // listing them under every synthesised agent would duplicate the
+            // same rows across the whole fleet, so a virtual agent only owns
+            // its main session key.
+            if (agent.virtual) {
+              return [
+                {
+                  key: `agent:${agent.id}:${MAIN_KEY}`,
+                  agentId: agent.id,
+                  updatedAt: Date.now(),
+                  displayName: "Main",
+                  origin: { label: agent.name, provider: "hermes" },
+                  modelProvider: "hermes",
+                },
+              ];
+            }
             const profile = asString(agent.profile);
             let stored = [];
             try {
@@ -812,11 +1099,19 @@ function createHermesAgentUpstream(options) {
       case "models.list": {
         try {
           const result = await client.request("model.options", {});
-          const options = Array.isArray(result?.options) ? result.options : [];
-          const models = options
-            .map((o) => asString(o?.id) || asString(o?.slug) || asString(o?.model))
-            .filter(Boolean)
-            .map((modelId) => ({ id: modelId, name: modelId }));
+          // model.options returns { providers: [{ slug, name, models: [...] }], model, provider }.
+          // Flatten each authenticated provider row into { provider, id } choices.
+          const rows = Array.isArray(result?.providers) ? result.providers : [];
+          const models = [];
+          for (const row of rows) {
+            const providerSlug = asString(row?.slug) || asString(row?.name);
+            const list = Array.isArray(row?.models) ? row.models : [];
+            for (const mid of list) {
+              const modelId = asString(mid);
+              if (!modelId) continue;
+              models.push({ id: modelId, name: modelId, provider: providerSlug });
+            }
+          }
           return resOk(id, { models: models.length ? models : [{ id: "hermes", name: "hermes" }] });
         } catch {
           return resOk(id, { models: [{ id: "hermes", name: "hermes" }] });
@@ -826,7 +1121,35 @@ function createHermesAgentUpstream(options) {
       case "skills.status": {
         try {
           const result = await client.request("skills.manage", { action: "list" });
-          const skills = Array.isArray(result?.skills) ? result.skills : [];
+          // `get_available_skills()` groups names by category
+          // ({ category: [names] }), while the office expects a flat
+          // SkillStatusEntry[] — flatten and fill the status fields the
+          // presentation layer derives readiness from.
+          const raw = result?.skills;
+          const names = Array.isArray(raw)
+            ? raw
+            : raw && typeof raw === "object"
+              ? Object.values(raw).flat()
+              : [];
+          const skills = Array.from(new Set(names.filter((name) => typeof name === "string"))).map(
+            (name) => ({
+              name,
+              description: "",
+              source: "hermes-bundled",
+              bundled: true,
+              filePath: "",
+              baseDir: "",
+              skillKey: name,
+              always: false,
+              disabled: false,
+              blockedByAllowlist: false,
+              eligible: true,
+              requirements: { bins: [], anyBins: [], env: [], config: [], os: [] },
+              missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
+              configChecks: [],
+              install: [],
+            }),
+          );
           return resOk(id, { skills });
         } catch {
           return resOk(id, { skills: [] });
@@ -835,14 +1158,162 @@ function createHermesAgentUpstream(options) {
 
       case "cron.list": {
         try {
-          // cron.manage reads the launch profile's scheduler, so the jobs
-          // belong to whichever agent that profile maps to.
+          // cron.manage reads the launch profile's scheduler, so jobs are
+          // attributed through the local store's job->agent mapping (backend
+          // rows carry no agent id); jobs the backend hides because they are
+          // paused are re-hydrated from that same store.
           const result = await client.request("cron.manage", { action: "list" });
-          return resOk(id, { jobs: toHermes3dCronJobs(result?.jobs, defaultAgentId) });
+          const store = loadVirtualStore();
+          const summaries = toHermes3dCronJobs(result?.jobs, (jobId) =>
+            asString(store.jobs[jobId]?.agentId, defaultAgentId),
+          );
+          for (const summary of summaries) {
+            const message = asString(store.jobs[summary.id]?.message);
+            if (message) summary.payload = { kind: "agentTurn", message };
+          }
+          const listed = new Set(summaries.map((entry) => entry.id));
+          for (const [jobId, meta] of Object.entries(store.jobs)) {
+            if (!listed.has(jobId)) summaries.push(toStoredCronJob(jobId, meta));
+          }
+          return resOk(id, { jobs: summaries });
         } catch (err) {
           log(`[hermes-agent] cron.manage failed: ${errorMessage(err)}`);
           return resOk(id, { jobs: [] });
         }
+      }
+
+      case "cron.add": {
+        const name = asString(p.name);
+        if (!name) {
+          return resErr(id, "hermes_agent.cron_name_required", "Cron job name is required.");
+        }
+        const agentId = asString(p.agentId, defaultAgentId);
+        const agent = agentRoster.find((a) => a.id === agentId);
+        const payload = p.payload && typeof p.payload === "object" ? p.payload : {};
+        const message = asString(payload.message) || asString(payload.text) || name;
+        const prompt = buildJobPrompt(agent, message);
+        const schedule = toBackendSchedule(p.schedule);
+
+        let created;
+        try {
+          created = await client.request(
+            "cron.manage",
+            { action: "add", name, schedule, prompt },
+            SESSION_RPC_TIMEOUT_MS
+          );
+        } catch (err) {
+          return resErr(id, "hermes_agent.cron_create_failed", errorMessage(err));
+        }
+        const jobId = asString(created?.job_id);
+        if (created?.success === false || !jobId) {
+          return resErr(
+            id,
+            "hermes_agent.cron_create_failed",
+            asString(created?.message, "hermes-agent did not create the job."),
+          );
+        }
+        // `enabled: false` means "parked until Run now": create the row, then
+        // pause it — the backend has no disabled-at-create option.
+        const enabled = p.enabled !== false;
+        if (!enabled) {
+          try {
+            await client.request(
+              "cron.manage",
+              { action: "pause", name: jobId },
+              SESSION_RPC_TIMEOUT_MS
+            );
+          } catch (err) {
+            log(`[hermes-agent] pause of cron job "${jobId}" failed: ${errorMessage(err)}`);
+          }
+        }
+        const store = loadVirtualStore();
+        store.jobs[jobId] = {
+          agentId,
+          name,
+          prompt,
+          message,
+          schedule,
+          enabled,
+          createdAt: Date.now(),
+        };
+        saveVirtualStore(store);
+        log(
+          `[hermes-agent] cron job "${name}" (${jobId}) created for agent "${agentId}"` +
+            (enabled ? "" : " (paused)"),
+        );
+        const summary = toHermes3dCronJobs(
+          [created?.job ?? { job_id: jobId, name, schedule }],
+          agentId,
+        )[0];
+        if (summary && !enabled) summary.enabled = false;
+        return resOk(id, summary ?? { id: jobId, name, agentId, enabled });
+      }
+
+      case "cron.remove": {
+        const jobId = asString(p.id);
+        if (!jobId) {
+          return resErr(id, "hermes_agent.cron_id_required", "Cron job id is required.");
+        }
+        let removed = false;
+        try {
+          const result = await client.request(
+            "cron.manage",
+            { action: "remove", name: jobId },
+            SESSION_RPC_TIMEOUT_MS
+          );
+          removed = result?.success !== false;
+        } catch (err) {
+          log(`[hermes-agent] cron remove of "${jobId}" failed: ${errorMessage(err)}`);
+        }
+        // Local mapping goes even when the backend already lost the row, so a
+        // paused job can never survive as a ghost in the office.
+        const store = loadVirtualStore();
+        if (store.jobs[jobId]) {
+          delete store.jobs[jobId];
+          saveVirtualStore(store);
+        }
+        return resOk(id, { ok: removed, removed });
+      }
+
+      case "cron.run": {
+        const jobId = asString(p.id);
+        const store = loadVirtualStore();
+        const meta = store.jobs[jobId];
+        if (!meta) {
+          // A backend-native job (created outside the office) has no stored
+          // prompt to replay — the gateway RPC has no run action either.
+          return resOk(id, { ok: false });
+        }
+        const sessionKey = `agent:${asString(meta.agentId, defaultAgentId)}:${MAIN_KEY}`;
+        let entry;
+        try {
+          entry = await ensureSession(sessionKey);
+        } catch (err) {
+          logError(`[hermes-agent] cron.run session for "${jobId}" failed.`, err);
+          return resOk(id, { ok: false });
+        }
+        // Replay through the normal chat-run machinery so the office console
+        // streams the turn like any other run.
+        const runId = randomUUID();
+        activeRuns.set(runId, { sessionKey, runtimeId: entry.runtimeId, buffer: "", aborted: false });
+        runBySessionKey.set(sessionKey, runId);
+        try {
+          await client.request(
+            "prompt.submit",
+            { session_id: entry.runtimeId, text: asString(meta.prompt, meta.name) },
+            SESSION_RPC_TIMEOUT_MS
+          );
+        } catch (err) {
+          activeRuns.delete(runId);
+          if (runBySessionKey.get(sessionKey) === runId) runBySessionKey.delete(sessionKey);
+          logError(`[hermes-agent] cron.run of "${jobId}" failed.`, err);
+          return resOk(id, { ok: false });
+        }
+        meta.lastRunAtMs = Date.now();
+        meta.lastStatus = "ok";
+        store.jobs[jobId] = meta;
+        saveVirtualStore(store);
+        return resOk(id, { ok: true, ran: true });
       }
 
       case "exec.approvals.get":

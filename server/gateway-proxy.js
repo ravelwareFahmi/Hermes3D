@@ -206,6 +206,7 @@ function createGatewayProxy(options) {
     let pendingConnectFrame = null;
     let pendingUpstreamSetupError = null;
     let closed = false;
+    let embeddedBridgeTried = false;
     const frameRateLimiter = createFrameRateLimiter();
     let upstreamHandshakeTimeoutId = null;
 
@@ -221,7 +222,10 @@ function createGatewayProxy(options) {
         browserWs.close(code, reason);
       } catch {}
       try {
-        upstreamWs?.close(code, reason);
+        // terminate() not close(): the browser socket may be mid-handshake
+        // (Chrome aborts upgrades it started too late), and close() on a
+        // CONNECTING raw upstream throws async into the error handler.
+        upstreamWs?.terminate();
       } catch {}
     };
 
@@ -344,6 +348,45 @@ function createGatewayProxy(options) {
         });
       }
 
+      // A "hermes" (raw WebSocket) selection pointed at a hermes-agent backend
+      // gets a 403 on the root-path upgrade: hermes-agent only serves /api/ws
+      // and speaks JSON-RPC. Retry once through the embedded bridge instead of
+      // failing the connect — the two transports share this proxy surface.
+      upstreamWs.on("unexpected-response", (req, res) => {
+        if (
+          !embeddedBridgeTried &&
+          upstreamAdapterType !== EMBEDDED_ADAPTER_TYPE &&
+          res?.statusCode === 403
+        ) {
+          embeddedBridgeTried = true;
+          log(
+            "[gateway-proxy] upstream 403 on raw transport; retrying via embedded hermes-agent bridge (JSON-RPC translation)"
+          );
+          if (upstreamHandshakeTimeoutId !== null) {
+            clearTimeout(upstreamHandshakeTimeoutId);
+            upstreamHandshakeTimeoutId = null;
+          }
+          try {
+            upstreamWs.removeAllListeners();
+            upstreamWs.terminate();
+          } catch {}
+          // ws emits a trailing 'error' for sockets closed mid-handshake even
+          // with listeners stripped; swallow it so it can't crash the process.
+          upstreamWs.on("error", () => {});
+          upstreamAdapterType = EMBEDDED_ADAPTER_TYPE;
+          upstreamWs = createHermesAgentUpstream({
+            url: upstreamUrl,
+            token: upstreamToken,
+            handshakeTimeoutMs: upstreamHandshakeTimeoutMs,
+            log,
+            logError,
+          });
+          attachUpstreamHandlers();
+          return;
+        }
+      });
+
+      const attachUpstreamHandlers = () => {
       upstreamHandshakeTimeoutId = setTimeout(() => {
         const timeoutError = {
           code: "studio.upstream_timeout",
@@ -364,6 +407,7 @@ function createGatewayProxy(options) {
           upstreamHandshakeTimeoutId = null;
         }
         upstreamReady = true;
+        log("proxy connected");
         maybeForwardPendingConnect();
       });
 
@@ -445,10 +489,10 @@ function createGatewayProxy(options) {
         }
         sendConnectError("studio.upstream_error", detail);
       });
+      };
 
-      log("proxy connected");
+      attachUpstreamHandlers();
     };
-
     void startUpstream();
 
     browserWs.on("message", async (raw) => {
