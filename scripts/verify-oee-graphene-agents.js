@@ -117,9 +117,16 @@ const main = async () => {
     console.log(
       `\nvirtual agents: ${virtualAgents.length}, paused playbook jobs on them: ${pausedForVirtual.length}`,
     );
-    if (virtualAgents.length !== 13) problems.push(`expected 13 virtual agents, got ${virtualAgents.length}`);
-    if (pausedForVirtual.length !== 13) {
-      problems.push(`expected 13 paused jobs, got ${pausedForVirtual.length}`);
+    // The roster grows over time (create-agent.js adds more), so assert the
+    // invariant that matters: every virtual agent has exactly one paused job.
+    // A fixed expected count would fail on any intentionally added agent.
+    if (virtualAgents.length === 0) {
+      problems.push("no virtual agents found");
+    }
+    for (const agent of virtualAgents) {
+      const owned = pausedForVirtual.filter((j) => j.agentId === agent.id);
+      if (owned.length === 0) problems.push(`${agent.id}: no paused playbook job`);
+      if (owned.length > 1) problems.push(`${agent.id}: ${owned.length} paused jobs (expected 1)`);
     }
 
     console.log("\nAGENTS.md spot-check (first 3 virtual agents):");
